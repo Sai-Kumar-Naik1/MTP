@@ -1,0 +1,2 @@
+QGeoTileProviderOsm: Tileserver disabled at  QUrl("http://maps-redirect.qt.io/osm/5.8/satellite")
+QGeoTileFetcherOsm: all providers resolved
