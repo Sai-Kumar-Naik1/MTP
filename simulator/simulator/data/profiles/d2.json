@@ -1,0 +1,15 @@
+{
+  "name": "d2",
+  "sysid": 2,
+  "mass_kg": 1.5,
+  "max_velocity_mps": 15.0,
+  "battery_capacity_mah": 6500.0,
+  "cruise_altitude_m": 50.0,
+  "sensors": [
+    "gps",
+    "imu",
+    "barometer",
+    "magnetometer",
+    "camera"
+  ]
+}

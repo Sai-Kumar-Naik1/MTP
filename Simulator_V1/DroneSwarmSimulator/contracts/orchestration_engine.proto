@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package swarm.engine;
+
+message Empty {}
+
+message EngineDroneConfig {
+    string drone_id = 1;
+}
+
+message RegisterResult {
+    bool success = 1;
+    string message = 2;
+}
+
+message MavlinkCommand {
+    string drone_id = 1;
+    string command = 2;
+}
+
+message ActionResult {
+    bool success = 1;
+    string message = 2;
+}
+
+service EmulationEngine {
+    rpc InstantiateDrone(EngineDroneConfig)
+        returns(RegisterResult);
+
+    rpc SendCommand(MavlinkCommand)
+        returns(ActionResult);
+}

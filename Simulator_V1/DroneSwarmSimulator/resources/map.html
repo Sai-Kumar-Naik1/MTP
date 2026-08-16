@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Drone Map</title>
+  <link rel="stylesheet" href="file:///c:/Users/naga kotam/Documents/MTP_Project/Simulator_V1/DroneSwarmSimulator/resources/leaflet/leaflet.css" />
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #map { height: 100vh; width: 100vw; }
+    .leaflet-div-icon {
+      background: transparent;
+      border: none;
+    }
+    .drone-marker {
+      background: #0d6efd;
+      border: 2px solid white;
+      border-radius: 50%;
+      width: 12px !important;
+      height: 12px !important;
+      margin-left: -6px !important;
+      margin-top: -6px !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="file:///c:/Users/naga kotam/Documents/MTP_Project/Simulator_V1/DroneSwarmSimulator/resources/leaflet/leaflet.js"></script>
+  <script>
+    if (typeof L === 'undefined') {
+      document.body.innerHTML = "<div style='padding:24px;font-family:sans-serif;color:#333;'>Map is unavailable because Leaflet failed to load. Check your internet connection or use a local Leaflet bundle.</div>";
+    } else {
+      const map = L.map('map').setView([12.9716, 77.5946], 14);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+
+      const droneMarkers = {};
+      let routeLine = null;
+
+      function onMapClick(event) {
+        const { lat, lng } = event.latlng;
+        if (window.mapBridge && typeof window.mapBridge.setSelectedEndPoint === 'function') {
+          window.mapBridge.setSelectedEndPoint(lat, lng);
+        }
+        L.marker([lat, lng]).addTo(map).bindPopup('Selected endpoint').openPopup();
+      }
+
+      window.requestMapClick = function () {
+        map.on('click', onMapClick);
+      };
+
+      window.renderRoute = function (payload) {
+        const { points } = payload;
+        if (!points || points.length === 0) {
+          return;
+        }
+
+        if (routeLine) {
+          map.removeLayer(routeLine);
+        }
+
+        routeLine = L.polyline(points, { color: '#ff7f0e', weight: 4, opacity: 0.8 }).addTo(map);
+        map.fitBounds(routeLine.getBounds(), { padding: [30, 30] });
+      };
+
+      window.renderDroneMarker = function (payload) {
+        const { drone_id, lat, lon, alt, status } = payload;
+        if (!droneMarkers[drone_id]) {
+          const icon = L.divIcon({ className: 'drone-marker', iconSize: [12, 12] });
+          droneMarkers[drone_id] = L.marker([lat, lon], { icon }).addTo(map);
+        } else {
+          droneMarkers[drone_id].setLatLng([lat, lon]);
+        }
+
+        droneMarkers[drone_id].bindPopup(`<b>${drone_id}</b><br>Status: ${status}<br>Alt: ${alt}m`);
+        if (!map.getBounds().contains([lat, lon])) {
+          map.panTo([lat, lon]);
+        }
+      };
+    }
+  </script>
+</body>
+</html>

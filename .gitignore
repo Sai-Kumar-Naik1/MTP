@@ -1,0 +1,47 @@
+# Virtual environments - machine-specific, rebuild with requirements.txt
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Cached OpenStreetMap tiles - regenerated on demand, ~50 MB
+simulator/simulator/data/tiles/
+Simulator_V1/DroneSwarmSimulator/resources/tiles/
+
+# Local archives/snapshots of the tree itself (simulator.zip bundles the venv
+# and tile cache, and is far past GitHub's 100 MB per-file limit)
+*.zip
+
+# Runtime logs
+*.log
+logs/
+
+# Test / coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and tooling local state
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# OS cruft
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store

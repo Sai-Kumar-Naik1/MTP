@@ -1,0 +1,16 @@
+{
+  "name": "d3",
+  "sysid": 3,
+  "mass_kg": 1.5,
+  "max_velocity_mps": 15.0,
+  "battery_capacity_mah": 100000.0,
+  "cruise_altitude_m": 50.0,
+  "sensors": [
+    "gps",
+    "imu",
+    "barometer",
+    "magnetometer",
+    "camera",
+    "lidar"
+  ]
+}

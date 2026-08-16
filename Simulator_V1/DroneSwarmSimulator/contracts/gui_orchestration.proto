@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package swarm.gui;
+
+message Empty {}
+
+message DroneConfig {
+    string drone_id = 1;
+    string drone_name = 2;
+}
+
+message RegisterResult {
+    bool success = 1;
+    string message = 2;
+}
+
+message TakeoffRequest {
+    string drone_id = 1;
+}
+
+message ActionResult {
+    bool success = 1;
+    string message = 2;
+}
+
+service SwarmOrchestration {
+
+    rpc RegisterDrone(DroneConfig)
+        returns(RegisterResult);
+
+    rpc Takeoff(TakeoffRequest)
+        returns(ActionResult);
+}
