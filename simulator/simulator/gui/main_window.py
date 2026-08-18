@@ -27,6 +27,7 @@ from gui.map_viewer import MapViewer
 from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import DEFAULT_BASE_URL, DEFAULT_WS_URL, OrchestrationClient
 from services.mavlink_backend import MavlinkSwarmBackend
+from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
     LocalFlightSimulator,
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         # always points at whichever is selected.
         self.local_sim = LocalFlightSimulator(self)
         self.mavlink_sim = MavlinkSwarmBackend(self)
+        self.thread_sim = ThreadSwarmBackend(self)
         self.flight_sim = self.local_sim
 
         self.drone_management = DroneManagementPanel(self.store)
@@ -129,6 +131,7 @@ class MainWindow(QMainWindow):
 
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("Local preview", "local")
+        self.backend_combo.addItem("Drone threads (UDP)", "threads")
         self.backend_combo.addItem("MAVLink (SITL)", "mavlink")
         self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
 
@@ -149,12 +152,17 @@ class MainWindow(QMainWindow):
         nothing else in the window changes."""
         self.local_sim.stop()
         self.mavlink_sim.stop()
+        self.thread_sim.stop()
         choice = self.backend_combo.currentData()
-        self.flight_sim = self.mavlink_sim if choice == "mavlink" else self.local_sim
+        self.flight_sim = {
+            "mavlink": self.mavlink_sim,
+            "threads": self.thread_sim,
+        }.get(choice, self.local_sim)
         self.statusBar().showMessage(
-            "Flight source: real MAVLink to SITL (start SITL before pressing Emulate)."
-            if choice == "mavlink"
-            else "Flight source: local kinematic preview."
+            {
+                "mavlink": "Flight source: real MAVLink to SITL (start SITL before pressing Emulate).",
+                "threads": "Flight source: independent drone threads, commanded over UDP.",
+            }.get(choice, "Flight source: local kinematic preview.")
         )
 
     def _build_status_bar(self) -> None:
@@ -182,7 +190,7 @@ class MainWindow(QMainWindow):
         self.client.request_failed.connect(self._on_request_failed)
 
         # Both flight sources feed the identical telemetry path as Module 2.
-        for backend in (self.local_sim, self.mavlink_sim):
+        for backend in (self.local_sim, self.mavlink_sim, self.thread_sim):
             backend.batch_ready.connect(self._on_telemetry)
             backend.progress.connect(self._on_flight_progress)
             backend.finished.connect(self._on_flight_finished)
@@ -192,6 +200,9 @@ class MainWindow(QMainWindow):
             backend.gps_restored.connect(self._on_gps_restored)
         self.mavlink_sim.link_failed.connect(
             lambda msg: self.statusBar().showMessage(f"MAVLink: {msg}", 15000)
+        )
+        self.thread_sim.link_failed.connect(
+            lambda msg: self.statusBar().showMessage(f"Drone node: {msg}", 15000)
         )
 
     # ---- Connection ----
@@ -270,6 +281,20 @@ class MainWindow(QMainWindow):
         self.fault_injection.update_active_sysids([f.config.sysid for f in cleared])
         self.map_viewer.clear_paths()
 
+        if self.flight_sim is self.thread_sim:
+            # One thread per drone, commanded over UDP by an in-process GCS.
+            if not self.thread_sim.start_mission(
+                [f.config for f in cleared], self._start_point, self._destination_point
+            ):
+                self.drone_management.set_running(False)
+                self.statusBar().showMessage("Could not start drone nodes - see the log.")
+                return
+            self.statusBar().showMessage(
+                f"Launched {len(cleared)} drone thread(s); NAVIGATE sent over UDP "
+                f"({self.thread_sim.time_scale:.0f}x speed)."
+            )
+            return
+
         if self.flight_sim is self.mavlink_sim:
             # Real vehicles: the same screened drones, flown over MAVLink.
             self.mavlink_sim.start_mission(
@@ -300,8 +325,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_fault_requested(self, command) -> None:
-        """Faults go to Module 2, and to the local preview when it is flying."""
-        self.client.inject_fault(command)
+        """Faults go to Module 2 when it is there, and to the active flight
+        source. Skipping the REST call while disconnected keeps its timeout
+        failure from overwriting the decision this fault triggers."""
+        if self._connected:
+            self.client.inject_fault(command)
         if self.flight_sim.is_active():
             affected = self.flight_sim.inject_fault(command)
             if not affected:
@@ -488,9 +516,10 @@ class MainWindow(QMainWindow):
                 self, "No active drones", "Check drones in the Drone Management panel before issuing a flock command."
             )
             return
-        self.client.flock(FlockCommand(sysids=sysids, destination=point))
+        if self._connected:
+            self.client.flock(FlockCommand(sysids=sysids, destination=point))
         self.statusBar().showMessage(
-            f"Flock command sent: {len(sysids)} drone(s) -> ({lat:.5f}, {lon:.5f})."
+            f"Destination set for {len(sysids)} drone(s) -> ({lat:.5f}, {lon:.5f})."
         )
 
     # ---- Telemetry wiring ----
