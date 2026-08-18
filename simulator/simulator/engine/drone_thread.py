@@ -166,6 +166,7 @@ class DroneThread(threading.Thread):
         battery_capacity_mah: float = 5200.0,
         start: Optional[Position] = None,
         telemetry_sink: Optional[Callable[[DroneSnapshot], None]] = None,
+        command_source: Optional[Callable[[], "list[Command]"]] = None,
         tick_s: float = DEFAULT_TICK_S,
         time_scale: float = 1.0,
     ):
@@ -200,6 +201,10 @@ class DroneThread(threading.Thread):
         self._running = threading.Event()
         self._inbox: "queue.Queue[Command]" = queue.Queue()
         self._telemetry_sink = telemetry_sink
+        # Optional pull-based transport (a UDP link, say). Polled once per tick
+        # so the drone still needs exactly one thread and stays unaware of
+        # whatever carries the commands.
+        self._command_source = command_source
         self._lock = threading.Lock()
         self._last_contact_s = time.monotonic()
         self._hold_requested = False
@@ -264,7 +269,15 @@ class DroneThread(threading.Thread):
     # ---- 1. receive_command ----
 
     def receive_command(self) -> None:
-        """Drain the inbox. Commands mutate intent, never position directly."""
+        """Drain the inbox, then whatever the transport has waiting.
+
+        Commands mutate intent, never position directly - motion is integrated
+        in `update_state` alone.
+        """
+        if self._command_source is not None:
+            for command in self._command_source():
+                self._inbox.put(command)
+
         while True:
             try:
                 command = self._inbox.get_nowait()

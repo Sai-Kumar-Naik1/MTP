@@ -30,6 +30,7 @@ class DroneFleet:
     def __init__(self, telemetry_queue: Optional["queue.Queue[DroneSnapshot]"] = None):
         self._drones: dict[int, DroneThread] = {}
         self._latest: dict[int, DroneSnapshot] = {}
+        self._links: dict[int, object] = {}
         self._lock = threading.Lock()
         self.telemetry_queue: "queue.Queue[DroneSnapshot]" = telemetry_queue or queue.Queue()
 
@@ -46,10 +47,29 @@ class DroneFleet:
         start: Optional[Position] = None,
         tick_s: float = 0.1,
         time_scale: float = 1.0,
+        link: Optional[object] = None,
     ) -> DroneThread:
-        """Create and start one drone node."""
+        """Create and start one drone node.
+
+        `link` is an optional transport (see `engine.drone_link.DroneLink`)
+        exposing `publish(snapshot)` and `poll_commands()`. When given, the
+        drone also answers to the network - the fleet keeps collecting
+        telemetry either way.
+        """
         if drone_id in self._drones:
             raise ValueError(f"drone {drone_id} already exists")
+
+        if link is None:
+            sink = self._collect
+            source = None
+        else:
+            def sink(snapshot: DroneSnapshot, _link=link) -> None:
+                self._collect(snapshot)
+                _link.publish(snapshot)
+
+            source = link.poll_commands
+            self._links[drone_id] = link
+
         drone = DroneThread(
             drone_id=drone_id,
             name=name,
@@ -57,7 +77,8 @@ class DroneFleet:
             cruise_altitude_m=cruise_altitude_m,
             battery_capacity_mah=battery_capacity_mah,
             start=start,
-            telemetry_sink=self._collect,
+            telemetry_sink=sink,
+            command_source=source,
             tick_s=tick_s,
             time_scale=time_scale,
         )
@@ -74,7 +95,15 @@ class DroneFleet:
             drone.shutdown()
         for drone in self._drones.values():
             drone.join(timeout=timeout_s)
+        for link in self._links.values():
+            close = getattr(link, "close", None)
+            if close is not None:
+                close()
         self._drones.clear()
+        self._links.clear()
+
+    def link(self, drone_id: int) -> Optional[object]:
+        return self._links.get(drone_id)
 
     # ---- Command fan-out ----
 
