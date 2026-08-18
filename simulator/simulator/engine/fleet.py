@@ -48,6 +48,7 @@ class DroneFleet:
         tick_s: float = 0.1,
         time_scale: float = 1.0,
         link: Optional[object] = None,
+        flight_controller: Optional[object] = None,
     ) -> DroneThread:
         """Create and start one drone node.
 
@@ -55,6 +56,10 @@ class DroneFleet:
         exposing `publish(snapshot)` and `poll_commands()`. When given, the
         drone also answers to the network - the fleet keeps collecting
         telemetry either way.
+
+        `flight_controller` is an optional firmware (see
+        `engine.flight_controller`). With one attached the drone translates its
+        commands to MAVLink and the controller flies the airframe.
         """
         if drone_id in self._drones:
             raise ValueError(f"drone {drone_id} already exists")
@@ -79,6 +84,7 @@ class DroneFleet:
             start=start,
             telemetry_sink=sink,
             command_source=source,
+            flight_controller=flight_controller,
             tick_s=tick_s,
             time_scale=time_scale,
         )

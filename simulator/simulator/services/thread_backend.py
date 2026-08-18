@@ -34,6 +34,7 @@ from engine.drone_thread import (
     Position,
     haversine_m as engine_haversine,
 )
+from engine.flight_controller import SimulatedFlightController
 from engine.fleet import DroneFleet
 from engine.gcs import GroundControlStation
 from engine.protocol import CommandName
@@ -135,8 +136,11 @@ class ThreadSwarmBackend(QObject):
     retargeted = Signal(int)
     link_failed = Signal(str)
 
-    def __init__(self, parent=None, time_scale: float = 20.0):
+    def __init__(self, parent=None, time_scale: float = 20.0, use_firmware: bool = True):
         super().__init__(parent)
+        # With firmware on, each drone drives a MAVLink flight controller
+        # rather than integrating its own motion.
+        self.use_firmware = use_firmware
         self._fleet: Optional[DroneFleet] = None
         self._gcs: Optional[GroundControlStation] = None
         self._views: dict[int, _FlightView] = {}
@@ -188,6 +192,15 @@ class ThreadSwarmBackend(QObject):
             except OSError as exc:
                 self.link_failed.emit(f"{drone.name}: cannot bind SYSID {drone.sysid} ({exc})")
                 continue
+            controller = None
+            if self.use_firmware:
+                controller = SimulatedFlightController(
+                    sysid=drone.sysid,
+                    home_lat=start.lat,
+                    home_lon=start.lon,
+                    cruise_speed_mps=drone.max_velocity_mps,
+                    battery_capacity_mah=drone.battery_capacity_mah,
+                )
             thread = self._fleet.spawn(
                 drone_id=drone.sysid,
                 name=drone.name,
@@ -197,6 +210,7 @@ class ThreadSwarmBackend(QObject):
                 start=home,
                 time_scale=self._time_scale,
                 link=link,
+                flight_controller=controller,
             )
             self._views[drone.sysid] = _FlightView(drone, thread, link, start)
 

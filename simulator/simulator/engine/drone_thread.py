@@ -167,6 +167,7 @@ class DroneThread(threading.Thread):
         start: Optional[Position] = None,
         telemetry_sink: Optional[Callable[[DroneSnapshot], None]] = None,
         command_source: Optional[Callable[[], "list[Command]"]] = None,
+        flight_controller: Optional[object] = None,
         tick_s: float = DEFAULT_TICK_S,
         time_scale: float = 1.0,
     ):
@@ -205,6 +206,20 @@ class DroneThread(threading.Thread):
         # so the drone still needs exactly one thread and stays unaware of
         # whatever carries the commands.
         self._command_source = command_source
+
+        # With a flight controller attached the drone stops being the physics
+        # and becomes an execution layer: commands are translated to MAVLink,
+        # the firmware flies, and state is read back from it. Without one, the
+        # internal kinematics below are used instead.
+        self.flight_controller = flight_controller
+        self.interpreter = None
+        if flight_controller is not None:
+            # Imported here: the interpreter imports this module for the
+            # command vocabulary, so a module-level import would be circular.
+            from engine.mavlink_interpreter import CommandInterpreter
+
+            self.interpreter = CommandInterpreter(sysid=drone_id)
+
         self._lock = threading.Lock()
         self._last_contact_s = time.monotonic()
         self._hold_requested = False
@@ -285,6 +300,7 @@ class DroneThread(threading.Thread):
                 return
             self._last_contact_s = time.monotonic()
             self._apply_command(command)
+            self._dispatch_to_firmware(command)
 
     def _apply_command(self, command: Command) -> None:
         kind, payload = command.type, command.payload
@@ -347,10 +363,54 @@ class DroneThread(threading.Thread):
                 self.gps_available = bool(payload.get("available", True))
                 self._note = "GPS lost" if not self.gps_available else "GPS reacquired"
 
+    def _dispatch_to_firmware(self, command: Command) -> None:
+        """Command Interpreter -> MAVLink Message -> Flight Controller."""
+        if self.flight_controller is None or self.interpreter is None:
+            return
+        if command.type is CommandType.SET_GPS:
+            # A GPS fault belongs to the firmware, not to this layer.
+            setter = getattr(self.flight_controller, "set_gps", None)
+            if setter is not None:
+                setter(bool(command.payload.get("available", True)))
+            return
+        for frame in self.interpreter.interpret(command):
+            self.flight_controller.send(frame)
+
+    def _service_firmware(self, dt: float) -> None:
+        """Step the firmware, answer its requests, and read the state back."""
+        self.flight_controller.update(dt)
+
+        # The mission protocol is a conversation: the controller asks for each
+        # waypoint in turn and the interpreter answers.
+        for message in self.flight_controller.receive():
+            for reply in self.interpreter.on_message(message):
+                self.flight_controller.send(reply)
+
+        st = self.flight_controller.state()
+        with self._lock:
+            self.elapsed_s += dt
+            self.position = Position(lat=st.lat, lon=st.lon, alt_m=st.relative_alt_m)
+            self.velocity = Velocity(
+                ground_speed_mps=st.ground_speed_mps,
+                heading_deg=st.heading_deg,
+                vertical_speed_mps=st.vertical_speed_mps,
+            )
+            self.battery = st.battery_pct
+            self.armed_status = st.armed
+            self.gps_available = st.gps_fix_type >= 2
+
     # ---- 2. update_state ----
 
     def update_state(self) -> None:
-        """Integrate motion and battery for one tick."""
+        """Integrate motion and battery for one tick.
+
+        With a flight controller attached the firmware owns the airframe and
+        this only mirrors what it reports.
+        """
+        if self.flight_controller is not None:
+            self._service_firmware(self.tick_s * self.time_scale)
+            return
+
         if self.mission_finished or self.mission_state is MissionState.IDLE:
             return
 
@@ -433,8 +493,44 @@ class DroneThread(threading.Thread):
 
     # ---- 4. execute_operation ----
 
+    def _mission_state_from_firmware(self) -> None:
+        """Read the flight controller's own mode and progress as our state."""
+        from engine.mavlink_interpreter import (
+            MODE_AUTO, MODE_BRAKE, MODE_GUIDED, MODE_LAND, MODE_LOITER, MODE_RTL,
+        )
+
+        st = self.flight_controller.state()
+        with self._lock:
+            if st.landed:
+                self.mission_state = MissionState.LANDED
+                self.current_operation = Operation.NONE
+                self._note = "landed"
+            elif self.battery <= 0.0:
+                self.mission_state = MissionState.FAILED
+                self._note = "battery exhausted - drone lost"
+            elif not st.armed:
+                self.mission_state = MissionState.IDLE if not st.landed else MissionState.LANDED
+            elif st.mode in (MODE_BRAKE, MODE_LOITER):
+                self.mission_state = MissionState.HOLDING
+                self._note = "holding" if self.gps_available else "holding - no GPS"
+            elif st.mode == MODE_LAND:
+                self.mission_state = MissionState.LANDING
+                self.current_operation = Operation.LAND
+            elif st.mode == MODE_RTL:
+                self.mission_state = MissionState.EN_ROUTE
+                self.current_operation = Operation.RETURN_TO_LAUNCH
+            elif st.relative_alt_m < self.cruise_altitude_m - 0.5 and st.mission_seq == 0:
+                self.mission_state = MissionState.TAKEOFF
+            elif st.mode in (MODE_AUTO, MODE_GUIDED):
+                self.mission_state = MissionState.EN_ROUTE
+                self.current_operation = Operation.GOTO
+
     def execute_operation(self) -> None:
         """Advance the mission state machine off the state just updated."""
+        if self.flight_controller is not None:
+            self._mission_state_from_firmware()
+            return
+
         if self.mission_finished:
             return
 
