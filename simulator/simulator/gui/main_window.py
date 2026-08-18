@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
     QDockWidget,
     QHBoxLayout,
     QLabel,
@@ -25,6 +26,7 @@ from gui.fault_injection import FaultInjectionPanel
 from gui.map_viewer import MapViewer
 from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import DEFAULT_BASE_URL, DEFAULT_WS_URL, OrchestrationClient
+from services.mavlink_backend import MavlinkSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
     LocalFlightSimulator,
@@ -53,7 +55,13 @@ class MainWindow(QMainWindow):
         # landing diverts to whichever of these is nearest.
         self._landing_candidates: list[LatLon] = []
         self._connected = False
-        self.flight_sim = LocalFlightSimulator(self)
+
+        # Two interchangeable flight sources with the same surface: the local
+        # kinematic preview, and real MAVLink to SITL/autopilots. `flight_sim`
+        # always points at whichever is selected.
+        self.local_sim = LocalFlightSimulator(self)
+        self.mavlink_sim = MavlinkSwarmBackend(self)
+        self.flight_sim = self.local_sim
 
         self.drone_management = DroneManagementPanel(self.store)
         self.map_viewer = MapViewer()
@@ -119,6 +127,11 @@ class MainWindow(QMainWindow):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
 
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("Local preview", "local")
+        self.backend_combo.addItem("MAVLink (SITL)", "mavlink")
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+
         container = QWidget()
         row = QHBoxLayout(container)
         row.setContentsMargins(4, 0, 4, 0)
@@ -127,7 +140,22 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("WS:"))
         row.addWidget(self.ws_url_edit)
         row.addWidget(self.connect_btn)
+        row.addWidget(QLabel("Flight source:"))
+        row.addWidget(self.backend_combo)
         toolbar.addWidget(container)
+
+    def _on_backend_changed(self) -> None:
+        """Swap the active flight source. Both expose the same surface, so
+        nothing else in the window changes."""
+        self.local_sim.stop()
+        self.mavlink_sim.stop()
+        choice = self.backend_combo.currentData()
+        self.flight_sim = self.mavlink_sim if choice == "mavlink" else self.local_sim
+        self.statusBar().showMessage(
+            "Flight source: real MAVLink to SITL (start SITL before pressing Emulate)."
+            if choice == "mavlink"
+            else "Flight source: local kinematic preview."
+        )
 
     def _build_status_bar(self) -> None:
         self.flight_label = QLabel("No flight")
@@ -153,14 +181,18 @@ class MainWindow(QMainWindow):
         self.client.connection_state_changed.connect(self._on_connection_state_changed)
         self.client.request_failed.connect(self._on_request_failed)
 
-        # Local preview feeds the identical telemetry path as Module 2.
-        self.flight_sim.batch_ready.connect(self._on_telemetry)
-        self.flight_sim.progress.connect(self._on_flight_progress)
-        self.flight_sim.finished.connect(self._on_flight_finished)
-        self.flight_sim.low_battery.connect(self._on_low_battery)
-        self.flight_sim.drone_lost.connect(self._on_drone_lost)
-        self.flight_sim.gps_lost.connect(self._on_gps_lost)
-        self.flight_sim.gps_restored.connect(self._on_gps_restored)
+        # Both flight sources feed the identical telemetry path as Module 2.
+        for backend in (self.local_sim, self.mavlink_sim):
+            backend.batch_ready.connect(self._on_telemetry)
+            backend.progress.connect(self._on_flight_progress)
+            backend.finished.connect(self._on_flight_finished)
+            backend.low_battery.connect(self._on_low_battery)
+            backend.drone_lost.connect(self._on_drone_lost)
+            backend.gps_lost.connect(self._on_gps_lost)
+            backend.gps_restored.connect(self._on_gps_restored)
+        self.mavlink_sim.link_failed.connect(
+            lambda msg: self.statusBar().showMessage(f"MAVLink: {msg}", 15000)
+        )
 
     # ---- Connection ----
 
@@ -237,6 +269,17 @@ class MainWindow(QMainWindow):
 
         self.fault_injection.update_active_sysids([f.config.sysid for f in cleared])
         self.map_viewer.clear_paths()
+
+        if self.flight_sim is self.mavlink_sim:
+            # Real vehicles: the same screened drones, flown over MAVLink.
+            self.mavlink_sim.start_mission(
+                [f.config for f in cleared], self._start_point, self._destination_point
+            )
+            self.statusBar().showMessage(
+                f"Connecting to {len(cleared)} SITL vehicle(s) over MAVLink and starting the mission..."
+            )
+            return
+
         if not self.flight_sim.start(cleared):
             return
 

@@ -141,6 +141,68 @@ it *Indefinite* and it holds until cleared.
 
 ---
 
+## Flight sources
+
+The toolbar's **Flight source** selector chooses what actually flies the mission.
+Both options present the same interface to the GUI, so every panel, dialog and
+protocol above behaves identically.
+
+### Local preview (default)
+
+Pure Python kinematics in `services/local_flight.py`. No MAVLink, no external
+process — this is what makes the app demonstrable on its own. Time-compressed
+as described above.
+
+### MAVLink (SITL)
+
+Real MAVLink to a real autopilot. `engine/mavlink_link.py` is the only module
+that encodes or decodes the protocol; `services/mavlink_backend.py` runs the
+mission on a worker thread and publishes the same `SwarmTelemetryBatch` schema.
+The GUI itself still never touches a MAVLink message.
+
+The source-to-destination task becomes a genuine command sequence:
+
+| Step | MAVLink |
+|---|---|
+| Enter GUIDED | `COMMAND_LONG` / `MAV_CMD_DO_SET_MODE` (176) |
+| Arm | `COMMAND_LONG` / `MAV_CMD_COMPONENT_ARM_DISARM` (400) |
+| Take off | `COMMAND_LONG` / `MAV_CMD_NAV_TAKEOFF` (22) |
+| Fly to destination *(and re-route)* | `SET_POSITION_TARGET_GLOBAL_INT` |
+| Fall back | `COMMAND_LONG` / `MAV_CMD_NAV_RETURN_TO_LAUNCH` (20) |
+| Land | mode `LAND` |
+
+Preconditions and exceptions become protocol events rather than local guesses:
+an arm refusal arrives as `COMMAND_ACK` / `MAV_RESULT_DENIED`, GPS loss as
+`GPS_RAW_INT.fix_type` dropping below a 2D fix, low battery as
+`SYS_STATUS.battery_remaining`. Telemetry is decoded from `HEARTBEAT`,
+`GLOBAL_POSITION_INT`, `ATTITUDE`, `SYS_STATUS` and `GPS_RAW_INT`, and the raw
+MAVLink log view now shows genuinely decoded messages.
+
+#### Running ArduPilot SITL
+
+SITL is not bundled and must be installed separately. On Windows the usual route
+is WSL2:
+
+```bash
+# inside WSL2 (Ubuntu)
+git clone --recurse-submodules https://github.com/ArduPilot/ardupilot
+cd ardupilot && Tools/environment_install/install-prereqs-ubuntu.sh -y
+. ~/.profile
+
+# one vehicle, streaming MAVLink to the Windows host
+sim_vehicle.py -v ArduCopter --console --map \
+    --out=udp:<WINDOWS_HOST_IP>:14550
+```
+
+Then set **Flight source → MAVLink (SITL)** and press **Emulate**. Each drone
+connects to `udpin:127.0.0.1:14550 + 10×index`, matching SITL's `--instance N`
+port convention, so a swarm of N needs N SITL instances.
+
+> Fault injection does not apply to real vehicles — you cannot order an
+> autopilot to lose GPS from a GCS. Use SITL's own parameters instead
+> (`param set SIM_GPS_DISABLE 1`), which the link observes through `GPS_RAW_INT`
+> exactly as it would a genuine failure.
+
 ## Architecture
 
 ### Drones are objects, not threads
