@@ -353,52 +353,123 @@ class SimulatedFlightController(FlightController):
 
 
 class MavlinkFlightController(FlightController):
-    """The same interface over UDP to a genuine ArduPilot or PX4."""
+    """The same interface over UDP to a genuine ArduPilot or PX4 (SITL).
 
-    def __init__(self, endpoint: tuple[str, int], bind_port: Optional[int] = None):
+    Binds a local port and learns the autopilot's address from its first
+    packet, which is how ArduPilot's `--out=udp:host:port` stream behaves. A
+    GCS heartbeat goes out periodically: autopilots expect one, and on an
+    outbound UDP socket it is what opens the return path.
+    """
+
+    def __init__(
+        self,
+        endpoint: Optional[tuple[str, int]] = None,
+        bind_host: str = "0.0.0.0",
+        bind_port: int = 14550,
+        heartbeat_interval_s: float = 1.0,
+    ):
         self.endpoint = endpoint
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if bind_port is not None:
-            self._sock.bind(("0.0.0.0", bind_port))
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((bind_host, bind_port))
         self._sock.setblocking(False)
-        self._rx = mav2.MAVLink(None, srcSystem=255)
+        self._rx = mav2.MAVLink(None, srcSystem=255, srcComponent=190)
         self._rx.robust_parsing = True
+        self._tx = mav2.MAVLink(None, srcSystem=255, srcComponent=190)
+        self._tx.robust_parsing = True
+
         self.st = FirmwareState()
+        self.bind_port = bind_port
+        self.heartbeat_interval_s = heartbeat_interval_s
+        self._last_heartbeat = 0.0
+        self._streams_requested = False
+        self.connected = False
+        self.frames_sent = 0
+        self.messages_seen = 0
+
+        if endpoint is not None:
+            self._announce()
+
+    # ---- Downlink ----
 
     def send(self, frame: bytes) -> None:
+        if self.endpoint is None:
+            return  # nowhere to send yet; the autopilot has not been heard from
         try:
             self._sock.sendto(frame, self.endpoint)
+            self.frames_sent += 1
         except OSError:
             pass
+
+    def _announce(self) -> None:
+        """Identify as a ground station, opening the return path."""
+        heartbeat = self._tx.heartbeat_encode(
+            mav2.MAV_TYPE_GCS, mav2.MAV_AUTOPILOT_INVALID, 0, 0, mav2.MAV_STATE_ACTIVE
+        )
+        self.send(heartbeat.pack(self._tx))
+
+    def _request_streams(self, rate_hz: int = 4) -> None:
+        request = self._tx.request_data_stream_encode(
+            1, 1, mav2.MAV_DATA_STREAM_ALL, rate_hz, 1
+        )
+        self.send(request.pack(self._tx))
+        self._streams_requested = True
+
+    # ---- Uplink ----
 
     def receive(self) -> list:
         messages = []
         while True:
             try:
-                raw, _ = self._sock.recvfrom(65535)
+                raw, sender = self._sock.recvfrom(65535)
             except (BlockingIOError, OSError):
                 break
-            decoded = self._rx.parse_buffer(raw) or []
-            for message in decoded:
+            if self.endpoint is None:
+                # First contact: this is where the autopilot lives.
+                self.endpoint = sender
+                self.connected = True
+                self._announce()
+            for message in self._rx.parse_buffer(raw) or []:
+                self.messages_seen += 1
                 self._absorb(message)
                 messages.append(message)
         return messages
 
     def _absorb(self, message) -> None:
         kind = message.get_type()
+        st = self.st
         if kind == "HEARTBEAT":
-            self.st.armed = bool(message.base_mode & mav2.MAV_MODE_FLAG_SAFETY_ARMED)
-            self.st.mode = message.custom_mode
+            self.connected = True
+            was_armed = st.armed
+            st.armed = bool(message.base_mode & mav2.MAV_MODE_FLAG_SAFETY_ARMED)
+            st.mode = message.custom_mode
+            # Disarming on the ground after a descent is a landing.
+            if was_armed and not st.armed and st.relative_alt_m < 1.0:
+                st.landed = True
         elif kind == "GLOBAL_POSITION_INT":
-            self.st.lat = message.lat / 1e7
-            self.st.lon = message.lon / 1e7
-            self.st.relative_alt_m = message.relative_alt / 1000.0
-            self.st.heading_deg = (message.hdg / 100.0) % 360.0
-            self.st.ground_speed_mps = math.hypot(message.vx, message.vy) / 100.0
+            st.lat = message.lat / 1e7
+            st.lon = message.lon / 1e7
+            st.relative_alt_m = message.relative_alt / 1000.0
+            st.heading_deg = (message.hdg / 100.0) % 360.0
+            st.ground_speed_mps = math.hypot(message.vx, message.vy) / 100.0
+            st.vertical_speed_mps = -message.vz / 100.0
         elif kind == "SYS_STATUS" and message.battery_remaining >= 0:
-            self.st.battery_pct = float(message.battery_remaining)
+            st.battery_pct = float(message.battery_remaining)
         elif kind == "GPS_RAW_INT":
-            self.st.gps_fix_type = message.fix_type
+            st.gps_fix_type = message.fix_type
+        elif kind == "MISSION_CURRENT":
+            st.mission_seq = message.seq
+        elif kind == "MISSION_ITEM_REACHED":
+            st.mission_seq = message.seq + 1
+
+    def update(self, dt: float) -> None:
+        """Real firmware keeps its own clock; only the link needs servicing."""
+        now = time.time()
+        if now - self._last_heartbeat >= self.heartbeat_interval_s:
+            self._last_heartbeat = now
+            self._announce()
+            if self.endpoint is not None and not self._streams_requested:
+                self._request_streams()
 
     def state(self) -> FirmwareState:
         return self.st
