@@ -15,7 +15,6 @@ ArduPilot or PX4. Swapping one for the other changes nothing above this layer -
 the drone thread only ever hands down frames and reads back state.
 """
 from __future__ import annotations
-
 import math
 import socket
 import time

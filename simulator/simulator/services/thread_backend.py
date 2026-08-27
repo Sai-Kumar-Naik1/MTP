@@ -26,6 +26,7 @@ from contracts.gui_orchestration import (
 )
 from engine.drone_link import DroneLink
 from engine.drone_thread import (
+    ARRIVAL_RADIUS_M,
     CRITICAL_BATTERY_PCT,
     LOW_BATTERY_PCT,
     DroneSnapshot,
@@ -145,6 +146,11 @@ class ThreadSwarmBackend(QObject):
         self._gcs: Optional[GroundControlStation] = None
         self._views: dict[int, _FlightView] = {}
         self._destination: Optional[LatLon] = None
+        # A PDDL-planned mission's full route per drone, and the index of the
+        # waypoint each is currently headed for. Absent for a plain
+        # start->destination mission, which has nothing to chain.
+        self._paths: dict[int, list[LatLon]] = {}
+        self._leg_index: dict[int, int] = {}
         self._time_scale = time_scale
         self._elapsed_s = 0.0
         self._tick = 0
@@ -175,16 +181,26 @@ class ThreadSwarmBackend(QObject):
         return list(self._views.values())
 
     def start_mission(self, drones: list[DroneConfig], start: LatLon, destination: LatLon) -> bool:
-        """Spawn a node per drone, then command the mission over UDP."""
+        """The plain, single-leg mission - a two-point path."""
+        return self.start_mission_path(drones, [start, destination])
+
+    def start_mission_path(self, drones: list[DroneConfig], waypoints: list[LatLon]) -> bool:
+        """Spawn a node per drone, then fly `waypoints` in order over UDP.
+
+        Each leg is commanded as an ordinary NAVIGATE; `_advance_legs` (called
+        every poll tick) sends the next one as soon as a drone reaches the
+        current target, so intermediate waypoints are passed through rather
+        than landed at - only the final one triggers a landing.
+        """
         self.stop()
-        if not drones:
+        if not drones or len(waypoints) < 2:
             return False
 
         self._gcs = GroundControlStation(verbose=False)
         self._gcs.start()
         self._fleet = DroneFleet()
-        self._destination = destination
-        home = Position(lat=start.lat, lon=start.lon)
+        self._destination = waypoints[-1]
+        home = Position(lat=waypoints[0].lat, lon=waypoints[0].lon)
 
         for drone in drones:
             try:
@@ -196,8 +212,8 @@ class ThreadSwarmBackend(QObject):
             if self.use_firmware:
                 controller = SimulatedFlightController(
                     sysid=drone.sysid,
-                    home_lat=start.lat,
-                    home_lon=start.lon,
+                    home_lat=waypoints[0].lat,
+                    home_lon=waypoints[0].lon,
                     cruise_speed_mps=drone.max_velocity_mps,
                     battery_capacity_mah=drone.battery_capacity_mah,
                 )
@@ -212,7 +228,7 @@ class ThreadSwarmBackend(QObject):
                 link=link,
                 flight_controller=controller,
             )
-            self._views[drone.sysid] = _FlightView(drone, thread, link, start)
+            self._views[drone.sysid] = _FlightView(drone, thread, link, waypoints[0])
 
         if not self._views:
             self.stop()
@@ -221,9 +237,11 @@ class ThreadSwarmBackend(QObject):
         self._gcs.register_many(self._views)
         self._gcs.wait_for_heartbeats(self._views, timeout_s=3.0)
 
-        source = [start.lat, start.lon, 0.0]
-        target = [destination.lat, destination.lon, drones[0].cruise_altitude_m]
+        source = [waypoints[0].lat, waypoints[0].lon, 0.0]
+        target = [waypoints[1].lat, waypoints[1].lon, drones[0].cruise_altitude_m]
         for sysid in self._views:
+            self._paths[sysid] = list(waypoints)
+            self._leg_index[sysid] = 1
             self._gcs.navigate(sysid, source, target)
 
         self._elapsed_s = 0.0
@@ -243,6 +261,8 @@ class ThreadSwarmBackend(QObject):
             self._gcs.stop()
             self._gcs = None
         self._views.clear()
+        self._paths.clear()
+        self._leg_index.clear()
 
     def pause(self) -> None:
         """Hold every node in place while the controller decides."""
@@ -265,6 +285,10 @@ class ThreadSwarmBackend(QObject):
         self._destination = destination
         altitude = next(iter(self._views.values())).config.cruise_altitude_m if self._views else 50.0
         for sysid in active:
+            # A diversion overrides whatever route was planned - the drone now
+            # flies straight to the new point, so there is no "next leg".
+            self._paths.pop(sysid, None)
+            self._leg_index.pop(sysid, None)
             self._send(
                 sysid,
                 CommandName.NAVIGATE,
@@ -280,6 +304,8 @@ class ThreadSwarmBackend(QObject):
         if view is None or view.is_done:
             return None
         self._emergency.add(sysid)
+        self._paths.pop(sysid, None)
+        self._leg_index.pop(sysid, None)
         if view.can_reach(view.start):
             self._send(sysid, CommandName.RETURN_TO_LAUNCH)
             return EmergencyLanding(
@@ -297,6 +323,8 @@ class ThreadSwarmBackend(QObject):
         if view is None or view.is_done:
             return None
         self._emergency.add(sysid)
+        self._paths.pop(sysid, None)
+        self._leg_index.pop(sysid, None)
         reachable = [p for p in candidates if view.can_reach(p)]
         target = nearest_point(view.position, reachable)
         if target is None:
@@ -383,7 +411,32 @@ class ThreadSwarmBackend(QObject):
             self.finished.emit(self._elapsed_s)
             return
 
+        self._advance_legs(snapshots)
         self._check_exceptions(snapshots)
+
+    def _advance_legs(self, snapshots: dict[int, DroneSnapshot]) -> None:
+        """Chain a PDDL-planned route: as soon as a drone reaches the
+        waypoint it is currently headed for, send it on to the next one
+        instead of letting it land there - only the final waypoint is
+        allowed to trigger a landing.
+        """
+        for sysid, snap in snapshots.items():
+            path = self._paths.get(sysid)
+            if not path:
+                continue
+            leg = self._leg_index.get(sysid, len(path) - 1)
+            if leg >= len(path) - 1:
+                continue  # already headed for the final destination
+            target = Position(lat=path[leg].lat, lon=path[leg].lon)
+            if engine_haversine(snap.position, target) > ARRIVAL_RADIUS_M:
+                continue
+            leg += 1
+            self._leg_index[sysid] = leg
+            altitude = self._views[sysid].config.cruise_altitude_m if sysid in self._views else 50.0
+            self._send(
+                sysid, CommandName.NAVIGATE,
+                destination=[path[leg].lat, path[leg].lon, altitude],
+            )
 
     def _check_exceptions(self, snapshots: dict[int, DroneSnapshot]) -> None:
         """Surface the first situation needing a decision, and hold the swarm."""

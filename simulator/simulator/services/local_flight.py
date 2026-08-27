@@ -356,6 +356,25 @@ class _Flight:
         )
 
 
+def plan_route_flights(drones: list[DroneConfig], waypoints: list[LatLon]) -> list[_Flight]:
+    """Like `plan_flights`, but for a multi-leg PDDL route instead of a
+    straight line - `_Flight.feasible`/`.required_mah`/`.range_m` only need
+    the total distance, so the same dataclass covers both cases.
+    """
+    total_distance = sum(haversine_m(a, b) for a, b in zip(waypoints, waypoints[1:]))
+    bearing = initial_bearing_deg(waypoints[0], waypoints[1]) if len(waypoints) > 1 else 0.0
+    return [
+        _Flight(
+            config=drone,
+            start=waypoints[0],
+            dest=waypoints[-1],
+            distance_m=total_distance,
+            bearing_deg=bearing,
+        )
+        for drone in drones
+    ]
+
+
 @dataclass
 class EmergencyLanding:
     """Where a drone was sent when the controller granted an emergency landing."""

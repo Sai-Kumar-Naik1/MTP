@@ -268,7 +268,7 @@ class DroneThread(threading.Thread):
 
     def run(self) -> None:
         self._running.set()
-        print(f"Drone {self.drone_id} Thread started")
+        print(f"Drone {self.drone_id} Thread started (thread id={self.native_id}, name={self.name})")
         try:
             while self._running.is_set():
                 self.receive_command()
@@ -279,7 +279,7 @@ class DroneThread(threading.Thread):
                 time.sleep(self.tick_s)
         finally:
             self._running.clear()
-            print(f"Drone {self.drone_id} Thread stopped")
+            print(f"Drone {self.drone_id} Thread stopped (thread id={self.native_id})")
 
     # ---- 1. receive_command ----
 

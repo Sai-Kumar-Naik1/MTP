@@ -102,6 +102,43 @@ class PointMarkerModel(QAbstractListModel):
         self.endResetModel()
 
 
+class RestrictedAreaModel(QAbstractListModel):
+    """The polygon marking the restricted area for the plan currently being
+    set up. Deliberately independent of `PathModel` (which live flight-path
+    trails also use) so this shape survives `clear_paths()` when a mission
+    starts, and only changes when a new plan is armed."""
+
+    POINTS = Qt.UserRole + 1
+    _ROLE_NAMES = {POINTS: b"points"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._points: list[tuple[float, float]] = []
+
+    def roleNames(self):
+        return dict(self._ROLE_NAMES)
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 1 if self._points else 0
+
+    def data(self, index, role):
+        if not index.isValid() or role != self.POINTS or not (0 <= index.row() < 1):
+            return None
+        return [{"latitude": lat, "longitude": lon} for lat, lon in self._points]
+
+    def set_polygon(self, points: list[tuple[float, float]]) -> None:
+        """`points` in click order. Closed automatically for rendering once
+        there are at least 3 of them."""
+        self.beginResetModel()
+        self._points = list(points)
+        if len(self._points) >= 3:
+            self._points.append(self._points[0])
+        self.endResetModel()
+
+    def clear(self) -> None:
+        self.set_polygon([])
+
+
 class PathModel(QAbstractListModel):
     """Per-drone flight-path vector overlays (a trailing polyline of recent positions)."""
 

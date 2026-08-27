@@ -58,11 +58,18 @@ def default_endpoint(index: int, host: str = "127.0.0.1") -> str:
 
 
 class _Mission:
-    """One vehicle's progress through the source-to-destination task."""
+    """One vehicle's progress through an ordered waypoint route.
 
-    def __init__(self, vehicle: MavlinkVehicle, destination: LatLon, altitude_m: float):
+    `path` is the full route (source, then every intermediate waypoint, then
+    the final destination); `leg_index` is the position in `path` currently
+    commanded as the position target. A plain source->destination mission is
+    just a two-point path.
+    """
+
+    def __init__(self, vehicle: MavlinkVehicle, path: list[LatLon], altitude_m: float):
         self.vehicle = vehicle
-        self.destination = destination
+        self.path = path
+        self.leg_index = 1  # heading for path[1]; path[0] is the starting point
         self.altitude_m = altitude_m
         self.home: Optional[LatLon] = None
         self.started_at = time.time()
@@ -77,6 +84,19 @@ class _Mission:
     @property
     def config(self) -> DroneConfig:
         return self.vehicle.config
+
+    @property
+    def destination(self) -> LatLon:
+        """The waypoint currently commanded as the position target."""
+        return self.path[self.leg_index]
+
+    @property
+    def final_destination(self) -> LatLon:
+        return self.path[-1]
+
+    @property
+    def on_final_leg(self) -> bool:
+        return self.leg_index >= len(self.path) - 1
 
     @property
     def position(self) -> LatLon:
@@ -133,8 +153,8 @@ class _Worker(QObject):
 
     # ---- Lifecycle (all invoked from the GUI thread via queued signals) ----
 
-    @Slot(list, object, object, list)
-    def start(self, drones: list, start: object, destination: object, endpoints: list) -> None:
+    @Slot(list, list, list)
+    def start(self, drones: list, path: list, endpoints: list) -> None:
         self.shutdown()
         missions: list[_Mission] = []
         for index, drone in enumerate(drones):
@@ -152,7 +172,7 @@ class _Worker(QObject):
                 self.link_failed.emit(f"{drone.name}: {exc}")
                 vehicle.close()
                 continue
-            mission = _Mission(vehicle, destination, drone.cruise_altitude_m)
+            mission = _Mission(vehicle, list(path), drone.cruise_altitude_m)
             mission.home = vehicle.snapshot.position
             missions.append(mission)
 
@@ -201,7 +221,10 @@ class _Worker(QObject):
         for mission in self._missions:
             if mission.is_done or mission.emergency:
                 continue
-            mission.destination = destination
+            # A diversion overrides whatever route was planned - fly straight
+            # to the new point from wherever the vehicle is now.
+            mission.path = [mission.position, destination]
+            mission.leg_index = 1
             mission.vehicle.set_mode(COPTER_MODE_GUIDED)
             mission.vehicle.goto(destination, mission.altitude_m)
 
@@ -224,7 +247,8 @@ class _Worker(QObject):
         if target is None:
             mission.vehicle.land()
         else:
-            mission.destination = target
+            mission.path = [mission.position, target]
+            mission.leg_index = 1
             mission.vehicle.set_mode(COPTER_MODE_GUIDED)
             mission.vehicle.goto(target, mission.altitude_m)
 
@@ -297,7 +321,13 @@ class _Worker(QObject):
 
         if vehicle.state is LinkState.CRUISING:
             if vehicle.distance_to_target_m() <= ARRIVAL_RADIUS_M:
-                vehicle.land()
+                if mission.on_final_leg:
+                    vehicle.land()
+                else:
+                    # Reached an intermediate waypoint - chain straight to the
+                    # next one instead of landing here.
+                    mission.leg_index += 1
+                    vehicle.goto(mission.destination, mission.altitude_m)
             return
 
         if vehicle.state is LinkState.LANDING:
@@ -354,7 +384,7 @@ class MavlinkSwarmBackend(QObject):
     retargeted = Signal(int)
     link_failed = Signal(str)
 
-    _start_requested = Signal(list, object, object, list)
+    _start_requested = Signal(list, list, list)
     _shutdown_requested = Signal()
     _pause_requested = Signal()
     _resume_requested = Signal()
@@ -416,8 +446,18 @@ class MavlinkSwarmBackend(QObject):
         destination: LatLon,
         endpoints: Optional[list[str]] = None,
     ) -> None:
+        self.start_mission_path(drones, [start, destination], endpoints)
+
+    def start_mission_path(
+        self,
+        drones: list[DroneConfig],
+        waypoints: list[LatLon],
+        endpoints: Optional[list[str]] = None,
+    ) -> None:
+        """Fly `waypoints` in order - each vehicle chains through every
+        intermediate point and only lands at the last one (see `_advance`)."""
         endpoints = endpoints or [default_endpoint(i) for i in range(len(drones))]
-        self._start_requested.emit(list(drones), start, destination, endpoints)
+        self._start_requested.emit(list(drones), list(waypoints), endpoints)
 
     def stop(self) -> None:
         self._active = False

@@ -1,0 +1,5 @@
+# ENHSP planner: cloned + built locally by scripts/setup_enhsp.ps1
+tools/enhsp/
+
+# Per-run generated PDDL problems and ENHSP output
+plans/*/runs/

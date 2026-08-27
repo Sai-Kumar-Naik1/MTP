@@ -24,9 +24,11 @@ from contracts.gui_orchestration import FlockCommand, LatLon
 from gui.drone_management import DroneManagementPanel
 from gui.fault_injection import FaultInjectionPanel
 from gui.map_viewer import MapViewer
+from gui.mission_planner_panel import MissionPlannerPanel
 from gui.telemetry_dashboard import TelemetryDashboard
 from services.api_client import DEFAULT_BASE_URL, DEFAULT_WS_URL, OrchestrationClient
 from services.mavlink_backend import MavlinkSwarmBackend
+from services.plan_service import PlanRunResult, PlanService
 from services.thread_backend import ThreadSwarmBackend
 from services.local_flight import (
     LOW_BATTERY_PCT,
@@ -35,8 +37,11 @@ from services.local_flight import (
     haversine_m,
     nearest_point,
     plan_flights,
+    plan_route_flights,
 )
 from services.storage import ProfileStore
+
+NFZ_CORNER_COUNT = 4  # a restricted area is a quadrilateral, click order = winding order
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +62,19 @@ class MainWindow(QMainWindow):
         self._landing_candidates: list[LatLon] = []
         self._connected = False
 
+        # PDDL mission planning: while armed, the next map clicks are a
+        # plan's start, then destination, then (if the panel's checkbox asks
+        # for one) the restricted area's corners - in that order, regardless
+        # of the map's own "Click mode" dropdown, which this drives itself
+        # so the user never has to operate it by hand mid-sequence.
+        self.plan_service = PlanService(self)
+        self._planning_mode = False
+        self._plan_mark_nfz = False
+        self._pending_plan_name: str | None = None
+        self._plan_source: LatLon | None = None
+        self._plan_destination: LatLon | None = None
+        self._plan_no_fly_zone: list[LatLon] = []
+
         # Two interchangeable flight sources with the same surface: the local
         # kinematic preview, and real MAVLink to SITL/autopilots. `flight_sim`
         # always points at whichever is selected.
@@ -69,6 +87,7 @@ class MainWindow(QMainWindow):
         self.map_viewer = MapViewer()
         self.telemetry_dashboard = TelemetryDashboard()
         self.fault_injection = FaultInjectionPanel()
+        self.mission_planner = MissionPlannerPanel()
 
         self.setCentralWidget(self.map_viewer)
 
@@ -81,6 +100,12 @@ class MainWindow(QMainWindow):
         self.right_dock.setWidget(self.fault_injection)
         self.right_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+
+        self.planner_dock = QDockWidget("Mission Planner", self)
+        self.planner_dock.setWidget(self.mission_planner)
+        self.planner_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.planner_dock)
+        self.splitDockWidget(self.right_dock, self.planner_dock, Qt.Vertical)
 
         # Working Area spans the full window width beneath the drone, map and
         # fault panels, so the map keeps the whole central area.
@@ -185,6 +210,10 @@ class MainWindow(QMainWindow):
         self.fault_injection.fault_requested.connect(self._on_fault_requested)
         self.fault_injection.status_message.connect(self.statusBar().showMessage)
 
+        self.mission_planner.plan_requested.connect(self._on_plan_requested)
+        self.plan_service.finished.connect(self._on_plan_ready)
+        self.plan_service.failed.connect(self._on_plan_failed)
+
         self.client.telemetry_received.connect(self._on_telemetry)
         self.client.connection_state_changed.connect(self._on_connection_state_changed)
         self.client.request_failed.connect(self._on_request_failed)
@@ -228,6 +257,25 @@ class MainWindow(QMainWindow):
 
     # ---- Drone management wiring ----
 
+    def _warn_grounded(self, grounded: list, total_count: int, distance_km: float, label: str = "leg") -> None:
+        """Tell the controller which drones the battery gate kept on the
+        ground, if any. Shared by the straight-leg Emulate flow and the PDDL
+        mission-planner flow."""
+        if not grounded:
+            return
+        detail = "\n".join(
+            f"- {f.config.name} (SYSID {f.config.sysid}): needs "
+            f"{f.required_mah:,.0f} mAh but carries {f.config.battery_capacity_mah:,.0f} mAh "
+            f"- range about {f.range_m / 1000:.1f} km at {f.cruise_speed_mps:.1f} m/s"
+            for f in grounded
+        )
+        QMessageBox.warning(
+            self,
+            "Not enough battery",
+            f"{len(grounded)} of {total_count} drone(s) cannot complete the "
+            f"{distance_km:.1f} km {label} and will not take off:\n\n{detail}",
+        )
+
     def _on_emulate(self, drones: list) -> None:
         self.client.set_endpoints(self.base_url_edit.text().strip(), self.ws_url_edit.text().strip())
         for drone in drones:
@@ -255,19 +303,7 @@ class MainWindow(QMainWindow):
         grounded = [f for f in flights if not f.feasible]
         distance_km = flights[0].distance_m / 1000.0
 
-        if grounded:
-            detail = "\n".join(
-                f"- {f.config.name} (SYSID {f.config.sysid}): needs "
-                f"{f.required_mah:,.0f} mAh but carries {f.config.battery_capacity_mah:,.0f} mAh "
-                f"- range about {f.range_m / 1000:.1f} km at {f.cruise_speed_mps:.1f} m/s"
-                for f in grounded
-            )
-            QMessageBox.warning(
-                self,
-                "Not enough battery",
-                f"{len(grounded)} of {len(flights)} drone(s) cannot complete the "
-                f"{distance_km:.1f} km leg and will not take off:\n\n{detail}",
-            )
+        self._warn_grounded(grounded, len(flights), distance_km)
 
         if not cleared:
             # Nothing launched, so unlock the configuration inputs again.
@@ -480,10 +516,16 @@ class MainWindow(QMainWindow):
         self._landing_candidates.clear()
         self._start_point = None
         self._destination_point = None
+        self._planning_mode = False
+        self._pending_plan_name = None
+        self._plan_source = None
+        self._plan_destination = None
+        self._plan_no_fly_zone = []
         self.client.stop_swarm()
         self.client.disconnect_telemetry()
         self.map_viewer.clear_markers()
         self.map_viewer.clear_paths()
+        self.map_viewer.clear_restricted_area()
         self.fault_injection.update_active_sysids([])
         self.statusBar().showMessage("Swarm stopped. Configuration inputs unlocked.")
 
@@ -492,6 +534,14 @@ class MainWindow(QMainWindow):
     def _on_point_picked(self, role: str, lat: float, lon: float) -> None:
         point = LatLon(lat=lat, lon=lon)
         self._landing_candidates.append(point)
+
+        if self._planning_mode:
+            # Order-driven, not role-driven: this is the Nth click of the
+            # plan's sequence regardless of what the map's "Click mode"
+            # dropdown says, because this code is what drives that dropdown -
+            # the user never has to operate it themselves mid-sequence.
+            self._handle_plan_click(point)
+            return
 
         if role != "destination":
             self._start_point = point
@@ -521,6 +571,146 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Destination set for {len(sysids)} drone(s) -> ({lat:.5f}, {lon:.5f})."
         )
+
+    # ---- Mission planner wiring ----
+
+    def _on_plan_requested(self, plan_name: str) -> None:
+        """Arm the map: the next clicks belong to this plan, not to the
+        ordinary flock-command flow - Start and Destination always, plus
+        `NFZ_CORNER_COUNT` restricted-area corners if the panel's checkbox
+        asks for one."""
+        self._pending_plan_name = plan_name
+        self._plan_source = None
+        self._plan_destination = None
+        self._plan_no_fly_zone = []
+        self._plan_mark_nfz = self.mission_planner.mark_restricted_area()
+        self._planning_mode = True
+        self.map_viewer.clear_markers()
+        self.map_viewer.clear_restricted_area()
+        self.map_viewer.mode_combo.setCurrentText("Set Start Point")
+        self.statusBar().showMessage(f"Plan '{plan_name}' armed - click the Start point on the map.")
+
+    def _handle_plan_click(self, point: LatLon) -> None:
+        """Consume one click of the armed plan's sequence: Start, then
+        Destination, then (if requested) `NFZ_CORNER_COUNT` restricted-area
+        corners - driving the map's Click mode as it goes, so the dropdown
+        never has to be touched by hand."""
+        name = self._pending_plan_name
+
+        if self._plan_source is None:
+            self._plan_source = point
+            self.map_viewer.mode_combo.setCurrentText("Set Destination Point")
+            self.statusBar().showMessage(
+                f"Plan '{name}': start set at ({point.lat:.5f}, {point.lon:.5f}) - "
+                f"now click the destination."
+            )
+            return
+
+        if self._plan_destination is None:
+            self._plan_destination = point
+            if self._plan_mark_nfz:
+                self.map_viewer.mode_combo.setCurrentText("Set Restricted Area")
+                self.statusBar().showMessage(
+                    f"Plan '{name}': destination set - click the restricted area's "
+                    f"corner 1 of {NFZ_CORNER_COUNT}."
+                )
+                return
+            self._planning_mode = False
+            self._run_planned_mission()
+            return
+
+        # Collecting the restricted-area's corners.
+        self._plan_no_fly_zone.append(point)
+        self.map_viewer.set_restricted_area(self._plan_no_fly_zone)
+        collected = len(self._plan_no_fly_zone)
+        if collected < NFZ_CORNER_COUNT:
+            self.statusBar().showMessage(
+                f"Plan '{name}': restricted-area corner {collected} of {NFZ_CORNER_COUNT} set - "
+                f"click the next corner."
+            )
+            return
+
+        self._planning_mode = False
+        self._run_planned_mission()
+
+    def _run_planned_mission(self) -> None:
+        if (
+            self._plan_source is None
+            or self._plan_destination is None
+            or self._pending_plan_name is None
+        ):
+            return
+        if not self.drone_management.checked_drones():
+            QMessageBox.information(
+                self, "No active drones",
+                "Check drones in the Drone Management panel before planning a mission.",
+            )
+            return
+        self.mission_planner.set_status(f"Running ENHSP for plan '{self._pending_plan_name}'...")
+        self.statusBar().showMessage(f"Running ENHSP for plan '{self._pending_plan_name}'...")
+        self.plan_service.run_async(
+            self._pending_plan_name, self._plan_source, self._plan_destination, self._plan_no_fly_zone
+        )
+
+    def _on_plan_ready(self, result: PlanRunResult) -> None:
+        self.mission_planner.set_plan_steps(result.plan_name, result.steps)
+
+        drones = self.drone_management.checked_drones()
+        if not drones:
+            self.mission_planner.set_status(f"Plan '{result.plan_name}' ready, but no drones are checked.")
+            self.statusBar().showMessage("Plan ready, but no drones are checked to fly it.")
+            return
+
+        flights = plan_route_flights(drones, result.waypoints)
+        cleared = [f for f in flights if f.feasible]
+        grounded = [f for f in flights if not f.feasible]
+        distance_km = flights[0].distance_m / 1000.0 if flights else 0.0
+        route_text = " -> ".join(result.location_names)
+
+        self._warn_grounded(grounded, len(flights), distance_km, label="route")
+
+        if not cleared:
+            self.mission_planner.set_status(
+                f"Plan '{result.plan_name}' ({route_text}, {distance_km:.1f} km): "
+                f"no drone has the battery for it."
+            )
+            self.statusBar().showMessage(
+                f"Plan '{result.plan_name}' ready, but no drone has the battery for the {distance_km:.1f} km route."
+            )
+            return
+
+        # This mission always flies the "drone firmware" pipeline: Command ->
+        # engine.mavlink_interpreter -> SimulatedFlightController.
+        threads_index = self.backend_combo.findData("threads")
+        if threads_index >= 0 and self.backend_combo.currentIndex() != threads_index:
+            self.backend_combo.setCurrentIndex(threads_index)
+
+        self.drone_management.set_running(True)
+        self.fault_injection.update_active_sysids([f.config.sysid for f in cleared])
+        self.map_viewer.clear_paths()
+
+        if not self.thread_sim.start_mission_path([f.config for f in cleared], result.waypoints):
+            self.drone_management.set_running(False)
+            self.statusBar().showMessage("Could not start drone nodes for the planned mission - see the log.")
+            return
+
+        self.mission_planner.set_status(
+            f"Flying plan '{result.plan_name}' ({route_text}, {distance_km:.1f} km) "
+            f"with {len(cleared)} drone(s)."
+        )
+        self.statusBar().showMessage(
+            f"Flying {len(cleared)} drone(s) on plan '{result.plan_name}': "
+            f"{distance_km:.1f} km via {max(0, len(result.waypoints) - 2)} waypoint(s)."
+        )
+        self._pending_plan_name = None
+        self._plan_source = None
+
+    def _on_plan_failed(self, message: str) -> None:
+        plan_name = self._pending_plan_name or "?"
+        self.mission_planner.set_error(f"Plan '{plan_name}' failed:\n\n{message}")
+        self.mission_planner.set_status("Planning failed - see the log below.")
+        QMessageBox.warning(self, "Mission planning failed", message)
+        self.statusBar().showMessage("Mission planning failed - see the dialog.", 8000)
 
     # ---- Telemetry wiring ----
 

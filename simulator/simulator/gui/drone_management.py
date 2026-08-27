@@ -246,3 +246,6 @@ class DroneManagementPanel(QWidget):
 
     def checked_sysids(self) -> list[int]:
         return [d.sysid for d in self._checked_drones()]
+
+    def checked_drones(self) -> list[DroneConfig]:
+        return self._checked_drones()
